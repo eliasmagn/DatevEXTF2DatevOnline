@@ -1,0 +1,179 @@
+import pandas as pd
+import tkinter as tk
+from tkinter import filedialog, messagebox, scrolledtext
+import logging
+import sys
+import csv
+
+DEBUG_MODE = "--debug" in sys.argv
+
+def setup_logging(debug=DEBUG_MODE):
+    level = logging.DEBUG if debug else logging.INFO
+    logging.basicConfig(
+        level=level,
+        format="%(asctime)s [%(levelname)s] %(message)s",
+        handlers=[
+            logging.FileHandler("konverter.log", mode='w', encoding="utf-8"),
+            logging.StreamHandler(sys.stdout)
+        ]
+    )
+    logging.info("Starte Konverter (Debug=%s)", debug)
+
+# Mapping Zielspaltenname → Quellspaltenname aus Zeile 2
+SPALTEN_MAPPING = {
+    'Währung': 'WKZ Umsatz',
+    'VorzBetrag': 'Umsatz (ohne Soll/Haben-Kz)',
+    'SollHaben': 'Soll/Haben-Kennzeichen',
+    'RechNr': 'Belegfeld_1',
+    'BelegDatum': 'Belegdatum',
+    'Belegtext': 'Buchungstext',
+    'UStSatz': 'Beleginfo - Inhalt 2',
+    'BU': 'BU-Schlüssel',
+    'Gegenkonto': 'Gegenkonto (ohne BU-Schlüssel)',
+    'Kost1': 'KOST1 - Kostenstelle',
+    'Kost2': 'KOST2 - Kostenstelle',
+    'Kostmenge': 'Kost-Menge',
+    'Skonto': 'Skonto',
+    'Nachricht': ''   # bleibt leer
+}
+
+ZIELFELDER = list(SPALTEN_MAPPING.keys())
+
+def vorzeichen_betrag(betrag_raw, sollhaben):
+    betrag_str = str(betrag_raw).replace(',', '.')
+    try:
+        betrag = float(betrag_str)
+    except Exception:
+        logging.warning("Betrag '%s' nicht konvertierbar.", betrag_raw)
+        return ''
+    if str(sollhaben).strip().upper() == "S":
+        val = f"-{betrag:.2f}".replace('.', ',')
+    elif str(sollhaben).strip().upper() == "H":
+        val = f"{betrag:.2f}".replace('.', ',')
+    else:
+        val = f"{betrag:.2f}".replace('.', ',')
+    logging.debug("vorzeichen_betrag: %s %s -> %s", betrag_raw, sollhaben, val)
+    return val
+
+def zeile_korrigieren_gui(zeilennr, fehlerzeile, delimiter=";"):
+    # Tkinter-Dialog zur manuellen Korrektur der Zeile
+    korrigiert = []
+    abgebrochen = []
+    def submit():
+        korrigiert.append(textfeld.get("1.0", tk.END).strip())
+        fenster.destroy()
+    def abbrechen():
+        abgebrochen.append(True)
+        fenster.destroy()
+    fenster = tk.Tk()
+    fenster.title(f"Fehlerhafte Zeile {zeilennr+1} manuell korrigieren")
+    tk.Label(fenster, text="Bitte korrigieren Sie die Zeile so, dass sie exakt zur Kopfzeile passt.\nAbbrechen bricht die gesamte Konvertierung ab!").pack(pady=4)
+    textfeld = scrolledtext.ScrolledText(fenster, width=120, height=4, wrap=tk.NONE)
+    textfeld.insert(tk.END, fehlerzeile)
+    textfeld.pack(padx=8, pady=8)
+    button_frame = tk.Frame(fenster)
+    button_frame.pack(pady=8)
+    tk.Button(button_frame, text="Korrigiert übernehmen", command=submit, bg="#4caf50", fg="white", width=22).pack(side=tk.LEFT, padx=5)
+    tk.Button(button_frame, text="Abbrechen", command=abbrechen, bg="#d32f2f", fg="white", width=22).pack(side=tk.LEFT, padx=5)
+    fenster.mainloop()
+    if abgebrochen:
+        return None
+    return korrigiert[0] if korrigiert else fehlerzeile
+
+def robust_datev_import_mit_korrektur(dateipfad, delimiter=";", encoding="latin1"):
+    """ Importiert ab Zeile 3, nutzt Zeile 2 als Kopf, Zeile 1 als Metadaten (ignoriert). """
+    rows = []
+    with open(dateipfad, encoding=encoding) as f:
+        reader = list(csv.reader(f, delimiter=delimiter, quoting=csv.QUOTE_MINIMAL))
+        header = reader[1]
+        erwartete_spalten = len(header)
+        for i, row in enumerate(reader[2:]):  # ab Zeile 3 (Index 2)
+            if len(row) != erwartete_spalten:
+                fehlerzeile = delimiter.join(row)
+                logging.warning("Zeile %d hat %d statt %d Spalten: %s", i+3, len(row), erwartete_spalten, fehlerzeile)
+                korrigiert = zeile_korrigieren_gui(i+2, fehlerzeile, delimiter)
+                if korrigiert is None:
+                    logging.info("User hat Abbruch gewählt (bei Zeile %d).", i+3)
+                    return None, header
+                # Nochmals splitten, falls weitere Korrektur nötig ist
+                new_row = korrigiert.split(delimiter)
+                while len(new_row) != erwartete_spalten:
+                    messagebox.showwarning(
+                        "Korrektur noch fehlerhaft",
+                        f"Die Korrektur ergibt {len(new_row)} Spalten, erwartet werden {erwartete_spalten}.\nBitte erneut anpassen."
+                    )
+                    korrigiert = zeile_korrigieren_gui(i+2, korrigiert, delimiter)
+                    if korrigiert is None:
+                        logging.info("User hat Abbruch gewählt (bei Zeile %d)", i+3)
+                        return None, header
+                    new_row = korrigiert.split(delimiter)
+                rows.append(new_row)
+                logging.info("Zeile %d erfolgreich korrigiert.", i+3)
+            else:
+                rows.append(row)
+    df = pd.DataFrame(rows, columns=header)
+    return df, header
+
+def konvertieren(quellpfad, zielpfad):
+    setup_logging()
+    df, header = robust_datev_import_mit_korrektur(quellpfad, delimiter=";", encoding="latin1")
+    if df is None:
+        messagebox.showwarning("Abbruch", "Die Konvertierung wurde abgebrochen.")
+        return
+
+    output = pd.DataFrame()
+    betraege = [
+        vorzeichen_betrag(row.get(SPALTEN_MAPPING['VorzBetrag'], ""), row.get(SPALTEN_MAPPING['SollHaben'], ""))
+        for _, row in df.iterrows()
+    ]
+    for ziel, quell in SPALTEN_MAPPING.items():
+        if ziel == 'VorzBetrag':
+            output[ziel] = betraege
+        elif quell == '':
+            output[ziel] = ""
+        elif quell in df.columns:
+            output[ziel] = df[quell].fillna("")
+        else:
+            output[ziel] = ""
+            logging.warning("Spalte '%s' nicht in Datei gefunden, bleibt leer!", quell)
+
+    try:
+        output.to_csv(zielpfad, sep=";", index=False, encoding="utf-8")
+        msg = f"Datei erfolgreich konvertiert: {zielpfad}"
+        logging.info(msg)
+        messagebox.showinfo("Fertig", msg)
+    except Exception as e:
+        logging.error("Fehler beim Speichern: %s", e)
+        messagebox.showerror("Fehler beim Speichern", str(e))
+
+def gui_start():
+    root = tk.Tk()
+    root.title("DATEV-Kassenbuch Konverter")
+
+    frame = tk.Frame(root, padx=15, pady=15)
+    frame.pack()
+
+    tk.Label(frame, text="Quell-CSV (DATEV-Export):").grid(row=0, column=0, sticky="w")
+    quell_entry = tk.Entry(frame, width=50)
+    quell_entry.grid(row=0, column=1)
+    tk.Button(frame, text="Durchsuchen...", command=lambda: quell_entry.delete(0, tk.END) or quell_entry.insert(0, filedialog.askopenfilename(filetypes=[("CSV Dateien", "*.csv")]))).grid(row=0, column=2)
+
+    tk.Label(frame, text="Ziel-CSV (für Import):").grid(row=1, column=0, sticky="w")
+    ziel_entry = tk.Entry(frame, width=50)
+    ziel_entry.grid(row=1, column=1)
+    tk.Button(frame, text="Speichern unter...", command=lambda: ziel_entry.delete(0, tk.END) or ziel_entry.insert(0, filedialog.asksaveasfilename(defaultextension=".csv", filetypes=[("CSV Dateien", "*.csv")]))).grid(row=1, column=2)
+
+    def start_konvertierung():
+        quell = quell_entry.get()
+        ziel = ziel_entry.get()
+        if not quell or not ziel:
+            messagebox.showerror("Fehler", "Bitte Quell- und Zieldatei auswählen!")
+            return
+        konvertieren(quell, ziel)
+
+    tk.Button(frame, text="Konvertieren", command=start_konvertierung, width=20, bg="#4caf50", fg="white").grid(row=2, column=1, pady=15)
+
+    root.mainloop()
+
+if __name__ == "__main__":
+    gui_start()

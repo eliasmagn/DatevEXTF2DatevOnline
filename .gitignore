@@ -205,3 +205,15 @@ cython_debug/
 marimo/_static/
 marimo/_lsp/
 __marimo__/
+
+
+#projekt specific
+
+datev_konverter_config.json
+*.csv
+
+#Mac/Windows/Editor-Extras
+.DS_Store
+Thumbs.db
+desktop.ini
+Icon?
