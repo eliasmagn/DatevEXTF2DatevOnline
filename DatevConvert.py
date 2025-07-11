@@ -8,6 +8,7 @@ import os
 import json
 from datetime import datetime
 import getpass
+import re
 
 DEBUG_MODE = "--debug" in sys.argv
 CONFIG_PATH = "datev_konverter_config.json"
@@ -24,63 +25,64 @@ def setup_logging(debug=DEBUG_MODE):
     )
     logging.info("Starte Konverter (Debug=%s)", debug)
 
-SPALTEN_MAPPING = {
-    'Währung': 'WKZ Umsatz',
-    'VorzBetrag': 'Umsatz (ohne Soll/Haben-Kz)',
-    'SollHaben': 'Soll/Haben-Kennzeichen',
-    'RechNr': 'Belegfeld_1',
-    'BelegDatum': 'Belegdatum',
-    'Belegtext': 'Buchungstext',
-    'UStSatz': 'Beleginfo - Inhalt 2',
-    'BU': 'BU-Schlüssel',
-    'Gegenkonto': 'Gegenkonto (ohne BU-Schlüssel)',
-    'Kost1': 'KOST1 - Kostenstelle',
-    'Kost2': 'KOST2 - Kostenstelle',
-    'Kostmenge': 'Kost-Menge',
-    'Skonto': 'Skonto',
-    'Nachricht': ''
+# Exakte DATEV-Kassenbuchfelder in der korrekten Reihenfolge
+DATEV_HEADERS = [
+    "Währung", "VorzBetrag", "RechNr", "BelegDatum", "Belegtext",
+    "UStSatz", "BU", "Gegenkonto", "Kost1", "Kost2", "Kostmenge", "Skonto", "Nachricht"
+]
+
+# Mapping aus dem EXTF-Export ins DATEV-Format (Anpassen falls Feldnamen abweichen!)
+EXTF_TO_DATEV = {
+    "Währung": "WKZ Umsatz",
+    "VorzBetrag": "Umsatz (ohne Soll/Haben-Kz)",
+    "SollHaben": "Soll/Haben-Kennzeichen",
+    "RechNr": "Belegfeld_1",
+    "BelegDatum": "Belegdatum",
+    "Belegtext": "Buchungstext",
+    "UStSatz": "Beleginfo - Inhalt 2",
+    "BU": "BU-Schlüssel",
+    "Gegenkonto": "Gegenkonto (ohne BU-Schlüssel)",
+    "Kost1": "KOST1 - Kostenstelle",
+    "Kost2": "KOST2 - Kostenstelle",
+    "Kostmenge": "Kost-Menge",
+    "Skonto": "Skonto",
+    "Nachricht": "",  # Optional/Freitext
 }
-ZIELFELDER = list(SPALTEN_MAPPING.keys())
 
 def vorzeichen_betrag(betrag_raw, sollhaben):
-    betrag_str = str(betrag_raw).replace(',', '.')
+    # Betrag nach DATEV: Komma als Dezimaltrennzeichen, Vorzeichen vorangestellt (+/-)
+    betrag_str = str(betrag_raw).replace('.', '').replace(',', '.').strip()
     try:
         betrag = float(betrag_str)
     except Exception:
         logging.warning("Betrag '%s' nicht konvertierbar.", betrag_raw)
         return ''
+    # Soll: Minus, Haben: Plus
     if str(sollhaben).strip().upper() == "S":
-        val = f"-{betrag:.2f}".replace('.', ',')
+        val = f"-{abs(betrag):.2f}".replace('.', ',')
     elif str(sollhaben).strip().upper() == "H":
-        val = f"{betrag:.2f}".replace('.', ',')
+        val = f"+{abs(betrag):.2f}".replace('.', ',')
     else:
         val = f"{betrag:.2f}".replace('.', ',')
     logging.debug("vorzeichen_betrag: %s %s -> %s", betrag_raw, sollhaben, val)
     return val
 
-def zeile_korrigieren_gui(zeilennr, fehlerzeile, delimiter=";"):
-    korrigiert = []
-    abgebrochen = []
-    def submit():
-        korrigiert.append(textfeld.get("1.0", tk.END).strip())
-        fenster.destroy()
-    def abbrechen():
-        abgebrochen.append(True)
-        fenster.destroy()
-    fenster = tk.Tk()
-    fenster.title(f"Fehlerhafte Zeile {zeilennr+1} manuell korrigieren")
-    tk.Label(fenster, text="Bitte korrigieren Sie die Zeile so, dass sie exakt zur Kopfzeile passt.\nAbbrechen bricht die gesamte Konvertierung ab!").pack(pady=4)
-    textfeld = scrolledtext.ScrolledText(fenster, width=120, height=4, wrap=tk.NONE)
-    textfeld.insert(tk.END, fehlerzeile)
-    textfeld.pack(padx=8, pady=8)
-    button_frame = tk.Frame(fenster)
-    button_frame.pack(pady=8)
-    tk.Button(button_frame, text="Korrigiert übernehmen", command=submit, bg="#4caf50", fg="white", width=22).pack(side=tk.LEFT, padx=5)
-    tk.Button(button_frame, text="Abbrechen", command=abbrechen, bg="#d32f2f", fg="white", width=22).pack(side=tk.LEFT, padx=5)
-    fenster.mainloop()
-    if abgebrochen:
-        return None
-    return korrigiert[0] if korrigiert else fehlerzeile
+def belegdatum_formatieren(dateval):
+    # DATEV verlangt TTMM (z.B. 0207 für 2. Juli)
+    try:
+        # Versucht, verschiedene Formate zu akzeptieren
+        for fmt in ("%d.%m.%Y", "%Y-%m-%d", "%d.%m.%y", "%d%m"):
+            try:
+                dt = datetime.strptime(str(dateval), fmt)
+                return f"{dt.day:02d}{dt.month:02d}"
+            except Exception:
+                continue
+        # Falls bereits TTMM, nichts ändern
+        if re.match(r"^\d{4}$", str(dateval)):
+            return str(dateval)
+    except Exception:
+        pass
+    return ""
 
 def robust_datev_import_mit_korrektur(dateipfad, delimiter=";", encoding="latin1"):
     rows = []
@@ -114,6 +116,30 @@ def robust_datev_import_mit_korrektur(dateipfad, delimiter=";", encoding="latin1
     df = pd.DataFrame(rows, columns=header)
     return df, header
 
+def zeile_korrigieren_gui(zeilennr, fehlerzeile, delimiter=";"):
+    korrigiert = []
+    abgebrochen = []
+    def submit():
+        korrigiert.append(textfeld.get("1.0", tk.END).strip())
+        fenster.destroy()
+    def abbrechen():
+        abgebrochen.append(True)
+        fenster.destroy()
+    fenster = tk.Tk()
+    fenster.title(f"Fehlerhafte Zeile {zeilennr+1} manuell korrigieren")
+    tk.Label(fenster, text="Bitte korrigieren Sie die Zeile so, dass sie exakt zur Kopfzeile passt.\nAbbrechen bricht die gesamte Konvertierung ab!").pack(pady=4)
+    textfeld = scrolledtext.ScrolledText(fenster, width=120, height=4, wrap=tk.NONE)
+    textfeld.insert(tk.END, fehlerzeile)
+    textfeld.pack(padx=8, pady=8)
+    button_frame = tk.Frame(fenster)
+    button_frame.pack(pady=8)
+    tk.Button(button_frame, text="Korrigiert übernehmen", command=submit, bg="#4caf50", fg="white", width=22).pack(side=tk.LEFT, padx=5)
+    tk.Button(button_frame, text="Abbrechen", command=abbrechen, bg="#d32f2f", fg="white", width=22).pack(side=tk.LEFT, padx=5)
+    fenster.mainloop()
+    if abgebrochen:
+        return None
+    return korrigiert[0] if korrigiert else fehlerzeile
+
 def konvertieren(quellpfad, zielpfad):
     setup_logging()
     df, header = robust_datev_import_mit_korrektur(quellpfad, delimiter=";", encoding="latin1")
@@ -121,24 +147,29 @@ def konvertieren(quellpfad, zielpfad):
         messagebox.showwarning("Abbruch", "Die Konvertierung wurde abgebrochen.")
         return
 
-    output = pd.DataFrame()
-    betraege = [
-        vorzeichen_betrag(row.get(SPALTEN_MAPPING['VorzBetrag'], ""), row.get(SPALTEN_MAPPING['SollHaben'], ""))
-        for _, row in df.iterrows()
-    ]
-    for ziel, quell in SPALTEN_MAPPING.items():
-        if ziel == 'VorzBetrag':
-            output[ziel] = betraege
-        elif quell == '':
-            output[ziel] = ""
-        elif quell in df.columns:
-            output[ziel] = df[quell].fillna("")
-        else:
-            output[ziel] = ""
-            logging.warning("Spalte '%s' nicht in Datei gefunden, bleibt leer!", quell)
+    output_rows = []
+    for idx, row in df.iterrows():
+        buchung = {}
+        # Währung
+        buchung["Währung"] = row.get(EXTF_TO_DATEV["Währung"], "EUR") or "EUR"
+        # Betrag
+        betrag = vorzeichen_betrag(row.get(EXTF_TO_DATEV["VorzBetrag"], ""), row.get(EXTF_TO_DATEV["SollHaben"], ""))
+        buchung["VorzBetrag"] = betrag
+        # Rechnungsnr/Feld 1
+        buchung["RechNr"] = row.get(EXTF_TO_DATEV["RechNr"], "")
+        # BelegDatum in TTMM
+        buchung["BelegDatum"] = belegdatum_formatieren(row.get(EXTF_TO_DATEV["BelegDatum"], ""))
+        # Freitext
+        buchung["Belegtext"] = row.get(EXTF_TO_DATEV["Belegtext"], "")
+        # USt, BU, Gegenkonto usw.
+        for feld in ["UStSatz", "BU", "Gegenkonto", "Kost1", "Kost2", "Kostmenge", "Skonto", "Nachricht"]:
+            quelle = EXTF_TO_DATEV[feld]
+            buchung[feld] = row.get(quelle, "") if quelle else ""
+        output_rows.append(buchung)
 
+    df_out = pd.DataFrame(output_rows, columns=DATEV_HEADERS)
     try:
-        output.to_csv(zielpfad, sep=";", index=False, encoding="utf-8")
+        df_out.to_csv(zielpfad, sep=";", index=False, encoding="utf-8", header=True, quoting=csv.QUOTE_MINIMAL)
         msg = f"Datei erfolgreich konvertiert: {zielpfad}"
         logging.info(msg)
         messagebox.showinfo("Fertig", msg)
@@ -159,8 +190,6 @@ def save_config(cfg):
     with open(CONFIG_PATH, "w", encoding="utf-8") as f:
         json.dump(cfg, f)
 
-import re
-
 def vorschlagsname_from(quellpfad, rule="Konvertiert_{basename}_{date}.csv"):
     basename = os.path.splitext(os.path.basename(quellpfad))[0]
     now = datetime.now()
@@ -171,8 +200,6 @@ def vorschlagsname_from(quellpfad, rule="Konvertiert_{basename}_{date}.csv"):
     day = now.strftime("%d")
     date = now.strftime("%Y%m%d-%H%M")
     user = getpass.getuser()
-
-    # Zeitraum aus Dateiname parsen
     match = re.search(r'_von_(\d{4})_(\d{2})_(\d{2})_bis_(\d{4})_(\d{2})_(\d{2})', basename)
     von, bis, zeitraum, monat, jahr = '', '', '', '', ''
     if match:
@@ -182,12 +209,10 @@ def vorschlagsname_from(quellpfad, rule="Konvertiert_{basename}_{date}.csv"):
         monat = monat_von
         jahr = jahr_von
         zeitraum = f"{jahr_von}-{monat_von}"
-    # Sonst auf aktuelles Jahr/Monat fallback
     else:
         von = bis = zeitraum = ''
         monat = month
         jahr = year
-
     vorschlag = rule.format(
         basename=basename, date=date, user=user,
         year=year, month=month, mon=mon, week=week, day=day,
@@ -201,20 +226,15 @@ def gui_start():
     last_quell = config.get("last_quell", "")
     last_ziel = config.get("last_ziel", "")
     name_rule = config.get("name_rule", "Konvertiert_{basename}_{date}.csv")
-
     root = tk.Tk()
     root.title("DATEV-Kassenbuch Konverter")
-
     frame = tk.Frame(root, padx=15, pady=15)
     frame.pack()
-
-    # Namensregel-Feld (NEU)
     tk.Label(frame, text="Regel für Ausgabedatei:").grid(row=0, column=0, sticky="w")
     rule_entry = tk.Entry(frame, width=50)
     rule_entry.grid(row=0, column=1, columnspan=2, sticky="w")
     rule_entry.insert(0, name_rule)
     tk.Label(frame, text="Platzhalter: {basename}, {date}, {year}, {month}, {mon}, {week}, \n {day}, {user}, {von}, {bis}, {monat}, {jahr}, {zeitraum}").grid(row=1, column=1, sticky="w")
-
     tk.Label(frame, text="Quell-CSV (DATEV-Export):").grid(row=2, column=0, sticky="w")
     quell_entry = tk.Entry(frame, width=50)
     quell_entry.grid(row=2, column=1)
@@ -229,7 +249,6 @@ def gui_start():
             ziel_entry.delete(0, tk.END)
             ziel_entry.insert(0, ziel_vorschlag)
     tk.Button(frame, text="Durchsuchen...", command=quell_browse).grid(row=2, column=2)
-
     tk.Label(frame, text="Ziel-CSV (für Import):").grid(row=3, column=0, sticky="w")
     ziel_entry = tk.Entry(frame, width=50)
     ziel_entry.grid(row=3, column=1)
@@ -240,7 +259,6 @@ def gui_start():
             ziel_entry.delete(0, tk.END)
             ziel_entry.insert(0, path)
     tk.Button(frame, text="Speichern unter...", command=ziel_browse).grid(row=3, column=2)
-
     def start_konvertierung():
         quell = quell_entry.get()
         ziel = ziel_entry.get()
@@ -255,9 +273,7 @@ def gui_start():
             "name_rule": rule
         }
         save_config(cfg)
-
     tk.Button(frame, text="Konvertieren", command=start_konvertierung, width=20, bg="#4caf50", fg="white").grid(row=4, column=1, pady=15)
-
     root.mainloop()
 
 if __name__ == "__main__":
