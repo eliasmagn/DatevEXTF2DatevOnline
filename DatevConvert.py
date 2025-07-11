@@ -113,7 +113,7 @@ def robust_datev_import_mit_korrektur(dateipfad, delimiter=";", encoding="latin1
                 logging.info("Zeile %d erfolgreich korrigiert.", i+3)
             else:
                 rows.append(row)
-    df = pd.DataFrame(rows, columns=header)
+    df = pd.DataFrame(rows, columns=header, dtype=str)
     return df, header
 
 def zeile_korrigieren_gui(zeilennr, fehlerzeile, delimiter=";"):
