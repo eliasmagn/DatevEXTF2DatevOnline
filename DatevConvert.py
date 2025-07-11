@@ -1,3 +1,4 @@
+
 import pandas as pd
 import tkinter as tk
 from tkinter import filedialog, messagebox, scrolledtext
@@ -164,9 +165,12 @@ def konvertieren(quellpfad, zielpfad):
         # USt, BU, Gegenkonto usw.
         for feld in ["UStSatz", "BU", "Gegenkonto", "Kost1", "Kost2", "Kostmenge", "Skonto", "Nachricht"]:
             quelle = EXTF_TO_DATEV[feld]
-            buchung[feld] = row.get(quelle, "") if quelle else ""
+            value = row.get(quelle, "") if quelle else ""
+            if feld == "BU":
+                if str(value).strip().lower() in ["0", "null", "none", "nan"]:
+                    value = ""
+            buchung[feld] = value
         output_rows.append(buchung)
-
     df_out = pd.DataFrame(output_rows, columns=DATEV_HEADERS)
     try:
         df_out.to_csv(zielpfad, sep=";", index=False, encoding="utf-8", header=True, quoting=csv.QUOTE_MINIMAL)
